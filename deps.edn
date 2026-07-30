@@ -1,0 +1,16 @@
+{:paths ["src"]
+ ;; The Kademlia message is protobuf; that is the only runtime dependency.
+ ;; Hashing (kad.key), HTTP (kad.routing) and record validation are all
+ ;; injected, so this library holds no crypto, no socket and no clock.
+ :deps {io.github.kotoba-lang/dev-protobuf
+        {:git/url "https://github.com/kotoba-lang/dev-protobuf.git"
+         :git/sha "fe67052627a70f3e406fab2f8dc475ea304be94c"}}
+ :aliases
+ {:test {:extra-paths ["test"]
+         :extra-deps {io.github.cognitect-labs/test-runner
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :main-opts ["-m" "cognitect.test-runner"]
+         :exec-fn cognitect.test-runner.api/test}
+  :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
+         :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test"
+                     "--fail-level" "error"]}}}

@@ -1,0 +1,282 @@
+(ns kad.kad-test
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            [kad.key :as kkey]
+            [kad.lookup :as lookup]
+            [kad.message :as msg]
+            [kad.routing :as routing]
+            [protobuf.wire :as pb]))
+
+;; A deterministic 32-octet "hash" — the keyspace properties under test are
+;; about XOR and ordering, not about SHA-256.
+(defn- fake-sha256 [b]
+  (let [v (mapv #(bit-and % 0xFF) (vec (seq #?(:clj b :cljs (array-seq b)))))]
+    #?(:clj (byte-array (map unchecked-byte (take 32 (concat v (repeat 0)))))
+       :cljs (js/Uint8Array.from (clj->js (take 32 (concat v (repeat 0))))))))
+
+(defn- k [& octets] (vec (take 32 (concat octets (repeat 0)))))
+
+;; ── keyspace ──────────────────────────────────────────────────────────────
+
+(deftest a-dht-key-is-always-thirty-two-octets
+  (is (= 32 (count (kkey/dht-key fake-sha256 (vec (pb/utf8-bytes "/ipns/x"))))))
+  (testing "a hash of the wrong length is refused rather than truncated"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (kkey/dht-key (fn [_] #?(:clj (byte-array 8) :cljs (js/Uint8Array. 8)))
+                               [1 2 3])))))
+
+(deftest xor-distance-is-a-metric-not-a-number
+  (is (= (k 0) (kkey/xor-distance (k 1 2 3) (k 1 2 3))) "distance to self is zero")
+  (is (= (kkey/xor-distance (k 1) (k 2)) (kkey/xor-distance (k 2) (k 1)))
+      "symmetric")
+  (is (= 32 (count (kkey/xor-distance (k 0xFF) (k 0x00))))))
+
+(deftest distances-compare-as-unsigned-big-endian
+  (is (neg? (kkey/compare-distance (k 0x01) (k 0x02))))
+  (is (pos? (kkey/compare-distance (k 0x80) (k 0x7F)))
+      "0x80 is 128, not -128; a signed comparison gets this backwards")
+  (is (zero? (kkey/compare-distance (k 5) (k 5))))
+  (testing "the first differing octet decides"
+    (is (neg? (kkey/compare-distance (k 1 0xFF) (k 2 0x00))))))
+
+(deftest sorting-by-closeness-to-a-target
+  (let [target (k 0x00)
+        peers [(k 0x0F) (k 0x01) (k 0xF0)]]
+    (is (= [(k 0x01) (k 0x0F) (k 0xF0)] (kkey/sort-closest target peers)))
+    (is (kkey/closer? target (k 0x01) (k 0x0F)))
+    (is (not (kkey/closer? target (k 0xF0) (k 0x01))))))
+
+(deftest the-common-prefix-length-is-the-bucket-index
+  (is (= 256 (kkey/leading-zeros (k 0))) "identical keys share every bit")
+  (is (= 0 (kkey/leading-zeros (k 0x80))) "top bit differs")
+  (is (= 7 (kkey/leading-zeros (k 0x01))))
+  (is (= 8 (kkey/leading-zeros (k 0x00 0x80))))
+  (is (= 3 (kkey/common-prefix-length (k 0x10) (k 0x00)))))
+
+(deftest hashing-is-what-makes-the-keyspace-uniform
+  ;; Two IPNS keys share the six-octet "/ipns/" prefix. Measured on the raw
+  ;; record keys they are adjacent; hashed, they are not.
+  (let [a (vec (pb/utf8-bytes "/ipns/aaaa"))
+        b (vec (pb/utf8-bytes "/ipns/bbbb"))]
+    ;; six identical octets = 48 bits, then 'a' (0x61) vs 'b' (0x62) differ
+    ;; only in the second-lowest bit, so six more.
+    (is (= 54 (kkey/common-prefix-length (vec (take 32 (concat a (repeat 0))))
+                                         (vec (take 32 (concat b (repeat 0))))))
+        "unhashed, they agree for 54 bits — every IPNS name piles into one corner")))
+
+;; ── wire messages ─────────────────────────────────────────────────────────
+
+(deftest a-get-value-round-trips
+  (let [rk (vec (pb/utf8-bytes "/ipns/somekey"))
+        m (msg/get-value rk)
+        bs (msg/encode m)]
+    (is (= m (msg/decode bs)))
+    (is (= 1 (:type (msg/decode bs))) "GET_VALUE is 1")
+    (is (pb/round-trips? msg/schema bs))))
+
+(deftest a-put-value-carries-the-ipns-record-nested-inside-a-libp2p-record
+  (let [rk (vec (pb/utf8-bytes "/ipns/somekey"))
+        ipns-bytes [0x0A 0x03 1 2 3]
+        m (msg/put-value rk ipns-bytes)
+        bs (msg/encode m)
+        back (msg/decode bs)]
+    (is (= 0 (:type back)) "PUT_VALUE is 0")
+    (is (= rk (get-in back [:record :key])))
+    (is (= ipns-bytes (msg/ipns-record-of back))
+        "the inner protobuf is the IPNS record — hand it to ipns.record/parse")
+    (is (pb/round-trips? msg/schema bs))))
+
+(deftest the-publisher-does-not-fill-in-time-received
+  (let [m (msg/put-value [1] [2])]
+    (is (nil? (get-in m [:record :time-received]))
+        "it is the receiving node's note about its own clock")))
+
+(deftest field-numbers-are-the-protocol
+  (is (= 2 (first (keep (fn [[n d]] (when (= :key (:name d)) n)) msg/schema))))
+  (is (= 8 (first (keep (fn [[n d]] (when (= :closer-peers (:name d)) n)) msg/schema))))
+  (is (= 10 (first (keep (fn [[n d]] (when (= :cluster-level-raw (:name d)) n)) msg/schema)))
+      "declaration order in the .proto is not wire order"))
+
+(deftest a-response-answering-a-different-key-is-detectable
+  (let [asked (vec (pb/utf8-bytes "/ipns/mine"))
+        answer (msg/put-value (vec (pb/utf8-bytes "/ipns/theirs")) [1 2 3])]
+    (is (not (msg/key-matches? answer asked))
+        "a signature proves who wrote a record, never which question it answered")
+    (is (msg/key-matches? (msg/put-value asked [1 2 3]) asked))))
+
+(deftest deprecated-record-fields-round-trip-as-unknown
+  ;; A peer sending the removed author(3)/signature(4) fields.
+  (let [legacy {1 {:name :key :type :bytes}
+                3 {:name :author :type :bytes}
+                4 {:name :signature :type :bytes}}
+        bs (pb/encode legacy {:key [1] :author [2] :signature [3]})]
+    (is (pb/round-trips? msg/record-schema bs)
+        "not declared, so they survive rather than being silently dropped")))
+
+;; ── the lookup state machine ──────────────────────────────────────────────
+
+(defn- peer [n] {:peer/id (str "p" n) :peer/dht-key (k n)})
+
+(deftest a-lookup-queries-alpha-peers-at-a-time
+  (let [s (lookup/start (k 0) (map peer [10 20 30 40 50]) {:alpha 3})]
+    (is (= ["p10" "p20" "p30"] (mapv :peer/id (lookup/next-queries s)))
+        "closest three, and only three")
+    (testing "and does not re-issue an outstanding query"
+      (let [s' (lookup/issue s (lookup/next-queries s))]
+        (is (= ["p40" "p50"] (mapv :peer/id (lookup/next-queries s'))))))))
+
+(deftest a-failed-peer-is-never-selected-again
+  (let [s (-> (lookup/start (k 0) (map peer [10 20 30]) {:alpha 1})
+              (lookup/issue [(peer 10)])
+              (lookup/failure "p10"))]
+    (is (= ["p20"] (mapv :peer/id (lookup/next-queries s)))
+        "otherwise the closest unreachable peer is chosen every round forever")
+    (is (contains? (:lookup/failed s) "p10"))
+    (testing "but it stays in the shortlist — it is still a fact about the topology"
+      (is (some #(= "p10" (:peer/id %)) (:lookup/shortlist s))))))
+
+(deftest responses-merge-and-re-sort-the-shortlist
+  (let [s (-> (lookup/start (k 0) [(peer 50)] {:alpha 3})
+              (lookup/issue [(peer 50)])
+              (lookup/response "p50" [(peer 90) (peer 5)]))]
+    (is (= ["p5" "p50" "p90"] (mapv :peer/id (:lookup/shortlist s)))
+        "appending without re-sorting makes next-queries pick the wrong peers")
+    (is (contains? (:lookup/queried s) "p50"))
+    (is (empty? (:lookup/in-flight s)))))
+
+(deftest progress-is-measured-against-the-closest-peer-not-the-shortlist-size
+  (let [before (lookup/start (k 0) [(peer 10)] {})
+        ;; fifty new peers, none closer than p10
+        no-progress (lookup/response before "p10" (map peer (range 100 150)))
+        progress (lookup/response before "p10" [(peer 1)])]
+    (is (false? (:lookup/progress? (lookup/round before no-progress)))
+        "a big round that got no closer is not progress — measuring growth never terminates")
+    (is (true? (:lookup/progress? (lookup/round before progress))))))
+
+(deftest a-value-lookup-stops-once-the-quorum-of-validated-records-is-met
+  (let [s (-> (lookup/start (k 0) (map peer [10 20 30]) {:quorum 2})
+              (lookup/record! "p10" {:seq 1}))]
+    (is (not (lookup/done? s)))
+    (is (lookup/done? (lookup/record! s "p20" {:seq 2})))))
+
+(deftest a-lookup-terminates-when-the-k-closest-have-all-answered
+  (let [peers (map peer (range 1 6))
+        s (reduce (fn [acc p] (lookup/response acc (:peer/id p) []))
+                  (lookup/start (k 0) peers {:k 5})
+                  peers)]
+    (is (lookup/done? s))
+    (is (= 5 (:queried (lookup/result s))))))
+
+(deftest a-full-lookup-converges-on-a-simulated-network
+  ;; Every peer knows the two peers immediately closer to the target than
+  ;; itself. A lookup started far away must walk in.
+  (let [all (into {} (map (fn [n] [(str "p" n) (peer n)])) (range 1 200))
+        query (fn [p]
+                (let [n #?(:clj (Long/parseLong (subs (:peer/id p) 1))
+                           :cljs (js/parseInt (subs (:peer/id p) 1) 10))]
+                  {:closer-peers (keep #(get all (str "p" %)) [(quot n 2) (dec (quot n 2))])
+                   :record (when (= 1 n) {:found true})}))
+        r (lookup/run (lookup/start (k 0) [(get all "p199")] {:alpha 3 :k 20 :quorum 1})
+                      query)]
+    (is (:done? r))
+    (is (= [{:found true}] (:records r)))
+    (is (< (:rounds r) 20) "it walks in, it does not scan")
+    (is (= "p1" (:peer/id (first (:closest r)))))))
+
+(deftest an-unreachable-network-terminates-rather-than-spinning
+  (let [r (lookup/run (lookup/start (k 0) (map peer [1 2 3]) {})
+                      (fn [_] (throw (ex-info "unreachable" {}))))]
+    (is (:done? r))
+    (is (= 3 (:failed r)))
+    (is (empty? (:records r)))))
+
+;; ── delegated routing ─────────────────────────────────────────────────────
+
+(defn- http-stub [responses]
+  (fn [{:keys [url method]}]
+    (let [r (get responses [method url])]
+      (cond
+        (nil? r) {:status 404}
+        (= :throw r) (throw (ex-info "connection refused" {}))
+        :else r))))
+
+(deftest a-record-is-fetched-with-the-ipns-record-media-type
+  (let [seen (atom nil)
+        http (fn [req] (reset! seen req) {:status 200 :body [1 2 3]})
+        r (routing/get-ipns http "https://r1/routing/v1" "k51abc")]
+    (is (:ok? r))
+    (is (= [1 2 3] (:record r)))
+    (is (= "https://r1/routing/v1/ipns/k51abc" (:url @seen)))
+    (is (= routing/ipns-record-content-type (get-in @seen [:headers "Accept"]))
+        "asking for application/json returns a summary you cannot verify a signature over")))
+
+(deftest a-router-that-fails-is-an-outcome-not-an-exception
+  (let [http (http-stub {[:get "https://down/routing/v1/ipns/k51abc"] :throw})]
+    (is (= :transport-error (:reason (routing/get-ipns http "https://down/routing/v1" "k51abc"))))
+    (is (= :not-found (:reason (routing/get-ipns (http-stub {}) "https://r/routing/v1" "k51abc"))))))
+
+(deftest resolution-requires-a-quorum-of-validated-records
+  (let [good [0x0A 0x01 0x01]
+        http (fn [{:keys [url]}]
+               (if (str/starts-with? url "https://r3")
+                 {:status 404}
+                 {:status 200 :body good}))
+        validate (fn [octets] (when (= good octets) {:sequence 5}))
+        r (routing/resolve http "k51abc"
+                           {:routers ["https://r1" "https://r2" "https://r3"]
+                            :quorum 2 :validate-fn validate})]
+    (is (:ok? r))
+    (is (= 2 (:agreed r)))
+    (is (= ["https://r1" "https://r2"] (:routers r)))))
+
+(deftest one-router-alone-cannot-satisfy-a-quorum-of-two
+  (let [http (fn [{:keys [url]}]
+               (if (str/starts-with? url "https://r1")
+                 {:status 200 :body [1]} {:status 404}))
+        r (routing/resolve http "k51abc"
+                           {:routers ["https://r1" "https://r2"]
+                            :quorum 2 :validate-fn (constantly {:sequence 1})})]
+    (is (false? (:ok? r)))
+    (is (= 1 (:agreed r)))
+    (is (= :no-valid-record (:reason r)))))
+
+(deftest a-record-that-does-not-validate-does-not-count
+  (let [http (constantly {:status 200 :body [9 9 9]})
+        r (routing/resolve http "k51abc"
+                           {:routers ["https://r1" "https://r2"]
+                            :quorum 1 :validate-fn (constantly nil)})]
+    (is (false? (:ok? r)))
+    (is (= 0 (:agreed r)))
+    (is (= :no-valid-record (:reason r))
+        "a router's answer is never trusted on the strength of having answered")))
+
+(deftest not-found-everywhere-is-distinguishable-from-everything-being-down
+  (let [nf (routing/resolve (constantly {:status 404}) "k51abc"
+                            {:routers ["https://r1"] :validate-fn (constantly nil)})
+        down (routing/resolve (fn [_] (throw (ex-info "x" {}))) "k51abc"
+                              {:routers ["https://r1"] :validate-fn (constantly nil)})]
+    (is (= :not-found (:reason nf)))
+    (is (= :all-routers-failed (:reason down)))))
+
+(deftest selection-runs-over-the-validated-records
+  (let [http (fn [{:keys [url]}]
+               {:status 200 :body (if (str/starts-with? url "https://old") [1] [2])})
+        r (routing/resolve http "k51abc"
+                           {:routers ["https://old" "https://new"]
+                            :quorum 1
+                            :validate-fn (fn [o] {:sequence (if (= [1] o) 1 9)})
+                            :select-fn (fn [rs] (apply max-key :sequence rs))})]
+    (is (= 9 (get-in r [:record :sequence]))
+        "a stale but validly-signed record loses to a newer one")))
+
+(deftest publishing-succeeds-if-any-router-accepted
+  (let [http (fn [{:keys [url]}]
+               (if (str/starts-with? url "https://ok") {:status 200} {:status 400}))
+        r (routing/publish http "k51abc" [1 2 3]
+                           {:routers ["https://ok" "https://bad"]})]
+    (is (:ok? r))
+    (is (= ["https://ok"] (:accepted r)))
+    (is (= 1 (count (:rejected r))))
+    (testing "and fails only when every router refused"
+      (is (false? (:ok? (routing/publish http "k51abc" [1]
+                                         {:routers ["https://bad"]})))))))
