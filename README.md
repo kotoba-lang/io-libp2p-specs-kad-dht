@@ -33,10 +33,9 @@ otherwise is the kind of thing this workspace exists to avoid.
 **What full participation still needs**, precisely: multiaddr parsing, a TCP or
 QUIC transport, a security handshake (Noise XX — [`kotoba-lang/noise`](https://github.com/kotoba-lang/noise)
 already implements the pattern), multistream-select 1.0.0, a stream muxer
-(Yamux), the identify protocol, and a k-bucket routing table. The **protocol
-half is already here**: `kad.message` speaks `/ipfs/kad/1.0.0` and `kad.lookup`
-is the algorithm. The gap is transport, and it is a project rather than a
-patch.
+(Yamux), and the identify protocol. The **protocol half is here**:
+`kad.message` speaks `/ipfs/kad/1.0.0`, `kad.lookup` is the algorithm, and
+`kad.table` is the routing table. The gap is transport.
 
 ## Modules
 
@@ -45,7 +44,32 @@ patch.
 | `kad.key` | record key → DHT key (`SHA-256`), XOR distance, closeness ordering, bucket index |
 | `kad.message` | the `/ipfs/kad/1.0.0` `Message` and the libp2p `Record` it carries |
 | `kad.lookup` | the iterative α=3 lookup, as `state + responses → state + next-queries` |
+| `kad.table` | the k-bucket routing table a *node* keeps, with Kademlia's eviction rule |
 | `kad.routing` | HTTP delegated routing (`/routing/v1`), multi-router with quorum |
+
+## The eviction rule is the eclipse defence
+
+`kad.table` holds `k` peers at *every distance scale* — bucket 0 covers half
+the keyspace, bucket 255 a single point — rather than the `k` globally-closest
+peers. A table of the closest peers knows nothing about the far half of the
+keyspace and cannot route a query there at all.
+
+When a bucket is full, Kademlia §2.2 does **not** evict the oldest peer for the
+new one. It pings the least recently seen peer; if it answers, it **stays and
+the newcomer is discarded**. That looks backwards until you see what it
+defends: long-lived peers are empirically likelier to stay up, and an attacker
+who can mint identities must not be able to displace established peers merely
+by showing up. A table that evicted on arrival would let anyone replace a
+node's entire view of the network — the eclipse attack.
+
+So `note-seen` never evicts on its own. It returns a `:probe` instruction and
+waits for `probe-alive` or `probe-dead`. There is a test that fifty fresh
+identities cannot take over a table whose incumbents keep answering.
+
+Order inside a bucket **is** the recency record, so there is no separate
+timestamp that can drift out of sync with it. And `closest` searches the whole
+table rather than the target's own bucket — the bucket index says where a peer
+lives, not that it is the closest thing we know.
 
 ## Details that fail silently
 
@@ -130,5 +154,5 @@ quorum, validation, selection and the `:not-found` / `:all-routers-failed` /
 clojure -M:test
 ```
 
-31 tests / 84 assertions, including a lookup converging over a simulated
+40 tests / 108 assertions, including a lookup converging over a simulated
 200-peer network and one that terminates against a wholly unreachable one.
