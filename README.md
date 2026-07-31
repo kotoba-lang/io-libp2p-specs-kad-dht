@@ -107,6 +107,23 @@ answered and nothing validated. There is a test.
 No HTTP client is imported: the caller owns the network, the timeouts and the
 TLS.
 
+**A synchronous `http-fn` is not universal.** A JVM job can supply one; a
+Cloudflare Worker cannot — `fetch` there is a Promise and nothing can await it
+inside a synchronous function. So the scoring is split out as `routing/score`,
+which takes responses **already fetched**:
+
+```clojure
+;; Worker: do the fetches concurrently, then score
+(-> (js/Promise.all (map fetch-one routers))
+    (.then (fn [responses]
+             (routing/score responses {:quorum 2 :validate-fn … :select-fn …}))))
+```
+
+`resolve` is exactly `score` plus fetching, and a test asserts the two reach
+the same verdict from the same inputs. Keeping the scoring pure also means
+quorum, validation, selection and the `:not-found` / `:all-routers-failed` /
+`:no-valid-record` distinction are testable with no transport at all.
+
 ## Test
 
 ```
