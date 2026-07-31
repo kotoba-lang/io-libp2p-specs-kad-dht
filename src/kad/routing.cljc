@@ -111,28 +111,21 @@
 
 ;; ── multi-router resolution ───────────────────────────────────────────────
 
-(defn resolve
-  "Resolve `name` through several routers and return the best **validated**
-  record.
+(defn score
+  "The pure half of `resolve`: given per-router responses **already fetched**,
+  validate each and pick the best.
 
-  `validate-fn` is `(fn [record-octets] -> validated-record-or-nil)` — the
-  caller wires it to `ipns.record/parse` + `ipns.record/validate` with its own
-  clock and verifier. This namespace deliberately cannot validate anything
-  itself: it holds no crypto, so it cannot be the place that decides a record
-  is genuine, and a router's answer is never trusted on the strength of having
-  answered.
+  Split out because a synchronous `http-fn` is not universal. A JVM job can
+  call one; a Cloudflare Worker cannot — `fetch` there is a Promise, and there
+  is no way to await it inside a synchronous function. A Worker therefore does
+  its own concurrent fetches, builds the same `{:ok? :record :router}` maps
+  `get-ipns` produces, and calls this.
 
-  `select-fn` picks among validated records — `ipns.record/select`, which
-  prefers the higher sequence number.
-
-  Returns `{:ok? true :record … :agreed n :routers [...]}` when at least
-  `quorum` routers returned a record that validated, else `{:ok? false …}` with
-  every router's outcome, so a caller can tell \"nobody has this name\" from
-  \"every router was down\"."
-  [http-fn name {:keys [routers quorum validate-fn select-fn]
-                 :or {routers default-routers quorum 1}}]
-  (let [responses (mapv #(get-ipns http-fn % name) routers)
-        validated (keep (fn [r]
+  Keeping the scoring pure also means the interesting logic — quorum,
+  validation, selection, and telling `:not-found` from `:all-routers-failed` —
+  is testable with no transport at all."
+  [responses {:keys [quorum validate-fn select-fn] :or {quorum 1}}]
+  (let [validated (keep (fn [r]
                           (when (:ok? r)
                             (when-let [v (validate-fn (:record r))]
                               (assoc r :validated v))))
@@ -161,6 +154,33 @@
        :agreed (count validated)
        :quorum quorum
        :responses responses})))
+
+(defn resolve
+  "Resolve `name` through several routers and return the best **validated**
+  record.
+
+  Requires a **synchronous** `http-fn`, so it suits a JVM job and not a
+  Cloudflare Worker; see `score` for the pure half a Worker composes with its
+  own async fetches.
+
+  `validate-fn` is `(fn [record-octets] -> validated-record-or-nil)` — the
+  caller wires it to `ipns.record/parse` + `ipns.record/validate` with its own
+  clock and verifier. This namespace deliberately cannot validate anything
+  itself: it holds no crypto, so it cannot be the place that decides a record
+  is genuine, and a router's answer is never trusted on the strength of having
+  answered.
+
+  `select-fn` picks among validated records — `ipns.record/select`, which
+  prefers the higher sequence number.
+
+  Returns `{:ok? true :record … :agreed n :routers [...]}` when at least
+  `quorum` routers returned a record that validated, else `{:ok? false …}` with
+  every router's outcome, so a caller can tell \"nobody has this name\" from
+  \"every router was down\"."
+  [http-fn name {:keys [routers quorum validate-fn select-fn]
+                 :or {routers default-routers quorum 1}}]
+  (score (mapv #(get-ipns http-fn % name) routers)
+         {:quorum quorum :validate-fn validate-fn :select-fn select-fn}))
 
 (defn publish
   "Publish through every router, and report per-router outcomes.

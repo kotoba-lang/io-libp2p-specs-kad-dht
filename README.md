@@ -113,5 +113,5 @@ TLS.
 clojure -M:test
 ```
 
-28 tests / 75 assertions, including a lookup converging over a simulated
+31 tests / 84 assertions, including a lookup converging over a simulated
 200-peer network and one that terminates against a wholly unreachable one.

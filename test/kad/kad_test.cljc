@@ -280,3 +280,40 @@
     (testing "and fails only when every router refused"
       (is (false? (:ok? (routing/publish http "k51abc" [1]
                                          {:routers ["https://bad"]})))))))
+
+;; ── the pure scoring half ─────────────────────────────────────────────────
+
+(deftest score-is-resolve-without-a-transport
+  ;; A Cloudflare Worker cannot supply a synchronous http-fn — fetch is a
+  ;; Promise and there is no way to await it inside a sync function — so it
+  ;; does its own concurrent fetches and calls score with the results.
+  (let [responses [{:ok? true :record [1] :router "https://r1"}
+                   {:ok? true :record [1] :router "https://r2"}]
+        r (routing/score responses {:quorum 2 :validate-fn (constantly {:sequence 3})})]
+    (is (:ok? r))
+    (is (= 2 (:agreed r)))
+    (is (= ["https://r1" "https://r2"] (:routers r)))))
+
+(deftest score-tells-the-three-failures-apart
+  (let [nf [{:ok? false :reason :not-found :router "https://r1"}]
+        down [{:ok? false :reason :transport-error :router "https://r1"}]
+        bad [{:ok? true :record [9] :router "https://r1"}]]
+    (is (= :not-found (:reason (routing/score nf {:validate-fn (constantly nil)}))))
+    (is (= :all-routers-failed (:reason (routing/score down {:validate-fn (constantly nil)}))))
+    (is (= :no-valid-record (:reason (routing/score bad {:validate-fn (constantly nil)})))
+        "routers answered and nothing verified — neither absence nor an outage")))
+
+(deftest resolve-and-score-agree
+  ;; resolve is score plus fetching, so the same inputs must give the same
+  ;; verdict through either door.
+  (let [http (fn [{:keys [url]}] (if (str/starts-with? url "https://r1")
+                                   {:status 200 :body [7]} {:status 404}))
+        via-resolve (routing/resolve http "k51abc"
+                                     {:routers ["https://r1" "https://r2"]
+                                      :quorum 1 :validate-fn (constantly {:sequence 1})})
+        via-score (routing/score [(routing/get-ipns http "https://r1" "k51abc")
+                                  (routing/get-ipns http "https://r2" "k51abc")]
+                                 {:quorum 1 :validate-fn (constantly {:sequence 1})})]
+    (is (= (:ok? via-resolve) (:ok? via-score)))
+    (is (= (:agreed via-resolve) (:agreed via-score)))
+    (is (= (:routers via-resolve) (:routers via-score)))))
