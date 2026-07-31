@@ -4,6 +4,7 @@
             [kad.key :as kkey]
             [kad.lookup :as lookup]
             [kad.message :as msg]
+            [kad.table :as table]
             [kad.routing :as routing]
             [protobuf.wire :as pb]))
 
@@ -317,3 +318,96 @@
     (is (= (:ok? via-resolve) (:ok? via-score)))
     (is (= (:agreed via-resolve) (:agreed via-score)))
     (is (= (:routers via-resolve) (:routers via-score)))))
+
+;; ── the k-bucket routing table ────────────────────────────────────────────
+
+(defn- tpeer [n] {:peer/id (str "p" n) :peer/dht-key (k n)})
+(def self (k 0))
+
+(deftest a-peer-lands-in-the-bucket-for-its-shared-prefix
+  (let [t (table/create self)]
+    (is (= 0 (table/bucket-index t (k 0x80))) "top bit differs")
+    (is (= 7 (table/bucket-index t (k 0x01))))
+    (is (= 8 (table/bucket-index t (k 0x00 0x80))))
+    (is (nil? (table/bucket-index t self))
+        "our own key has no bucket; returning 256 would put the node in its own table")))
+
+(deftest the-table-holds-k-peers-at-every-distance-scale
+  ;; Not the k globally-closest — that table would know nothing about the far
+  ;; half of the keyspace and could not route a query there at all.
+  (let [t (reduce (fn [acc p] (:table (table/note-seen acc p 1)))
+                  (table/create self {:k 2})
+                  (map tpeer [0x80 0xC0 0x01 0x02]))]
+    (is (= 2 (count (table/peers-in t 0))) "the far half")
+    (is (pos? (count (table/all-peers t))))
+    (is (> (count (table/bucket-sizes t)) 1) "peers spread across scales")))
+
+(deftest seeing-a-known-peer-moves-it-to-the-recent-end
+  (let [t (-> (table/create self) (table/note-seen (tpeer 0x80) 1) :table
+              (table/note-seen (tpeer 0x81) 2) :table
+              (table/note-seen (tpeer 0x80) 3) :table)]
+    (is (= ["p129" "p128"] (mapv :peer/id (table/peers-in t 0)))
+        "order in the bucket IS the recency record, so there is no timestamp to drift from it")
+    (is (= 3 (:peer/last-seen (last (table/peers-in t 0)))))))
+
+(deftest a-full-bucket-asks-for-a-probe-rather-than-evicting
+  (let [t (reduce (fn [acc p] (:table (table/note-seen acc p 1)))
+                  (table/create self {:k 2})
+                  [(tpeer 0x80) (tpeer 0x81)])
+        r (table/note-seen t (tpeer 0x82) 5)]
+    (is (= "p128" (:peer/id (:probe r))) "the least recently seen")
+    (is (= "p130" (:peer/id (:pending r))))
+    (is (= t (:table r)) "nothing changed until the probe is answered")))
+
+(deftest an-answering-incumbent-keeps-its-place-and-the-newcomer-is-discarded
+  ;; Kademlia §2.2, and the reason it looks backwards: long-lived peers are
+  ;; more likely to stay up, and an attacker who can mint identities must not
+  ;; be able to displace them just by showing up. That is the eclipse defence.
+  (let [t (reduce (fn [acc p] (:table (table/note-seen acc p 1)))
+                  (table/create self {:k 2})
+                  [(tpeer 0x80) (tpeer 0x81)])
+        {:keys [probe pending]} (table/note-seen t (tpeer 0x82) 5)
+        t' (table/probe-alive t probe 5)]
+    (is (= #{"p128" "p129"} (set (mapv :peer/id (table/peers-in t' 0)))))
+    (is (nil? (table/find-peer t' (:peer/id pending)))
+        "showing up is not enough to enter a full bucket")
+    (is (= "p128" (:peer/id (last (table/peers-in t' 0))))
+        "and the incumbent is now the most recently seen")))
+
+(deftest a-silent-incumbent-is-replaced
+  (let [t (reduce (fn [acc p] (:table (table/note-seen acc p 1)))
+                  (table/create self {:k 2})
+                  [(tpeer 0x80) (tpeer 0x81)])
+        {:keys [probe pending]} (table/note-seen t (tpeer 0x82) 5)
+        t' (table/probe-dead t probe pending 5)]
+    (is (nil? (table/find-peer t' "p128")))
+    (is (some? (table/find-peer t' "p130")))
+    (is (= 2 (count (table/peers-in t' 0))))))
+
+(deftest a-flood-of-newcomers-cannot-take-over-a-table
+  (let [t (reduce (fn [acc p] (:table (table/note-seen acc p 1)))
+                  (table/create self {:k 2})
+                  [(tpeer 0x80) (tpeer 0x81)])
+        ;; 50 fresh identities, every probe answered by the incumbent
+        flooded (reduce (fn [acc n]
+                          (let [{:keys [probe table]} (table/note-seen acc (tpeer (+ 0x82 n)) 9)]
+                            (if probe (table/probe-alive acc probe 9) table)))
+                        t (range 50))]
+    (is (= #{"p128" "p129"} (set (mapv :peer/id (table/peers-in flooded 0))))
+        "eviction on arrival would have replaced the node's whole view of the network")))
+
+(deftest closest-searches-the-whole-table-not-one-bucket
+  (let [t (reduce (fn [acc p] (:table (table/note-seen acc p 1)))
+                  (table/create self)
+                  (map tpeer [0x01 0x02 0x80 0xC0]))
+        c (table/closest t (k 0x00) 3)]
+    (is (= 3 (count c)))
+    (is (= ["p1" "p2" "p128"] (mapv :peer/id c))
+        "answering from the target's own bucket returns fewer peers than we have")))
+
+(deftest removal-and-staleness
+  (let [t (-> (table/create self) (table/note-seen (tpeer 0x80) 100) :table
+              (table/note-seen (tpeer 0x01) 900) :table)]
+    (is (= 2 (table/size t)))
+    (is (= ["p128"] (mapv :peer/id (table/stale-peers t 500))))
+    (is (= 1 (table/size (table/remove-peer t "p128"))))))
