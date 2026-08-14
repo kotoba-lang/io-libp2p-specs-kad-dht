@@ -351,6 +351,109 @@
                    (mapv #(get-providers http-fn % cid opts) routers)
                    {:quorum quorum}))
 
+;; ── peers (HTTP routing v1 GET /peers/{peer-id}) ──────────────────────────
+
+(defn- peers-of [body]
+  (or (:Peers body) (:peers body)
+      (get body "Peers") (get body "peers") []))
+
+(defn- peer-protocols [p]
+  (or (:Protocols p) (:protocols p)
+      (get p "Protocols") (get p "protocols") []))
+
+(defn- routing-peer
+  "Same shape as `kotoba.protocol.route/record`, by convention not by
+  require. This library must not depend on kotoba-protocol."
+  [asked p]
+  (let [id (provider-id p)]
+    (when (string? id)
+      {:plane :routing
+       :peer id
+       :asked asked
+       :addrs (vec (provider-addrs p))
+       :protocols (vec (peer-protocols p))})))
+
+(defn get-peer
+  "Fetch where `peer-id` is reachable from one delegated router.
+
+  GET `{router}/peers/{peer-id}`. Spec: 404 MUST be read as 200 with 0
+  results. Never throws. Never rewrites `peer-id`. A different `ID` in
+  the body is still returned — the caller checks `:peer` against
+  `:asked`. This is routing, not discovery: no CID is involved.
+
+  `parse-fn` is required when `body` is not already a map."
+  ([http-fn router peer-id]
+   (get-peer http-fn router peer-id {}))
+  ([http-fn router peer-id {:keys [parse-fn]}]
+   (if-not (and (string? peer-id) (pos? (count peer-id)))
+     {:ok? false :reason :invalid-peer :value peer-id :router router}
+     (try
+       (let [{:keys [status body]} (http-fn {:method :get
+                                             :url (str router "/peers/" peer-id)
+                                             :headers {"Accept" providers-accept}})
+             parsed (body->map body parse-fn)]
+         (cond
+           (= 404 status)
+           {:ok? true :peers [] :router router :asked peer-id :empty? true}
+           (not= 200 status)
+           {:ok? false :reason :http-error :status status :router router :asked peer-id}
+           (nil? parsed)
+           {:ok? false :reason :empty-body :router router :asked peer-id}
+           (#{:unparsed :parse-failed} parsed)
+           {:ok? false :reason :body-not-map :router router :asked peer-id}
+           (not (map? parsed))
+           {:ok? false :reason :body-not-map :router router :asked peer-id}
+           :else
+           {:ok? true
+            :peers (vec (keep #(routing-peer peer-id %) (peers-of parsed)))
+            :router router
+            :asked peer-id}))
+       (catch #?(:clj Exception :cljs :default) e
+         {:ok? false :reason :transport-error :router router :asked peer-id
+          :detail #?(:clj (.getMessage e) :cljs (str e))})))))
+
+(defn score-peers
+  "Pure half of `find-peers`: union by `:peer`. Quorum counts routers
+  that answered. Empty union with quorum met is success — we asked,
+  nobody knows this peer. All transport failures are `:all-routers-failed`."
+  [peer-id responses {:keys [quorum] :or {quorum 1}}]
+  (let [ok (filterv :ok? responses)
+        by-id (reduce (fn [m p]
+                        (if (string? (:peer p))
+                          (assoc m (:peer p) p)
+                          m))
+                      {}
+                      (mapcat :peers ok))]
+    (if (>= (count ok) quorum)
+      {:ok? true
+       :asked peer-id
+       :peers (vec (vals by-id))
+       :answered (count ok)
+       :routers (mapv :router ok)
+       :responses responses}
+      {:ok? false
+       :asked peer-id
+       :reason (if (empty? ok) :all-routers-failed :quorum-unmet)
+       :answered (count ok)
+       :quorum quorum
+       :responses responses})))
+
+(defn find-peers
+  "Ask several delegated routers where `peer-id` is reachable.
+
+  This process is still not a DHT node. Production:
+
+      (fn [peer]
+        (kad.routing/find-peers http-fn peer opts))
+
+  then `kotoba.protocol.route/lookup-live`."
+  [http-fn peer-id {:keys [routers quorum]
+                    :or {routers default-routers quorum 1}
+                    :as opts}]
+  (score-peers peer-id
+               (mapv #(get-peer http-fn % peer-id opts) routers)
+               {:quorum quorum}))
+
 ;; ── provide (historic PUT /providers — not in routing v1) ─────────────────
 
 (defn provider-envelope
@@ -363,7 +466,13 @@
   sign and does not invent a clock: `sign-fn` and `timestamp-ms` are
   injected or omitted. Omitting them is not a pass on authenticity —
   a router that requires a signature will 400, which is the useful
-  answer."
+  answer.
+
+  There is no default `sign-fn` here. IPIP-0526 is historic and
+  untested; the bytes to sign (DAG-JSON vs DAG-CBOR) were never
+  settled (IPIP-378 closed). Shipping a kad-owned signer would be
+  forging a protocol. Callers that already have Kubo's signed record
+  may pass `sign-fn`; this namespace will not invent one."
   [{:keys [cid peer addrs timestamp-ms advisory-ttl sign-fn]}]
   (cond
     (not (string? cid)) {:ok? false :reason :invalid-cid :value cid}
