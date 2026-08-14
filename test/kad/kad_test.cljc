@@ -444,6 +444,59 @@
     (is (= "{\"Providers\":[]}" (:body @seen))
         "this library holds no JSON encoder")))
 
+(deftest an-injected-sign-fn-is-not-a-kad-signer
+  (let [env (routing/provider-envelope (assoc provider-rec :sign-fn (constantly "caller-bytes")))]
+    (is (= "caller-bytes" (get-in env [:envelope :Providers 0 :Signature]))
+        "kad attaches whatever the caller returned; it does not hash or encode")))
+
+(def ^:private routing-peer-id "12D3KooWpeer")
+
+(deftest get-peer-does-not-rewrite-the-peer-id
+  (let [seen (atom nil)
+        http (fn [req]
+               (reset! seen req)
+               {:status 200
+                :body {:Peers [{:Schema "peer"
+                                :ID routing-peer-id
+                                :Addrs ["/ip4/127.0.0.1/tcp/4001"]
+                                :Protocols ["transport-bitswap"]}]}})
+        r (routing/get-peer http "https://r/routing/v1" routing-peer-id)]
+    (is (:ok? r))
+    (is (= routing-peer-id (:asked r)))
+    (is (= routing-peer-id (:peer (first (:peers r)))))
+    (is (= :routing (:plane (first (:peers r)))))
+    (is (= (str "https://r/routing/v1/peers/" routing-peer-id) (:url @seen)))
+    (is (= :get (:method @seen)))))
+
+(deftest a-404-from-peers-is-answered-empty-not-an-outage
+  (let [r (routing/get-peer (http-stub {}) "https://r/routing/v1" routing-peer-id)]
+    (is (:ok? r))
+    (is (= [] (:peers r)))
+    (is (true? (:empty? r)))))
+
+(deftest find-peers-tells-empty-from-down
+  (let [empty (routing/find-peers (constantly {:status 404}) routing-peer-id
+                                  {:routers ["https://r1/routing/v1"]})
+        down (routing/find-peers (fn [_] (throw (ex-info "x" {}))) routing-peer-id
+                                 {:routers ["https://r1/routing/v1"]})]
+    (is (:ok? empty))
+    (is (= [] (:peers empty)))
+    (is (false? (:ok? down)))
+    (is (= :all-routers-failed (:reason down)))))
+
+(deftest find-peers-unions-by-peer-across-routers
+  (let [http (fn [{:keys [url]}]
+               {:status 200
+                :body {:Peers (if (str/starts-with? url "https://r1")
+                                [{:ID routing-peer-id :Addrs ["/ip4/1.1.1.1/tcp/4001"]}]
+                                [{:ID "12D3KooWother"}])}})
+        r (routing/find-peers http routing-peer-id
+                              {:routers ["https://r1/routing/v1" "https://r2/routing/v1"]
+                               :quorum 2})]
+    (is (:ok? r))
+    (is (= 2 (:answered r)))
+    (is (= #{routing-peer-id "12D3KooWother"} (set (map :peer (:peers r)))))))
+
 ;; ── the pure scoring half ─────────────────────────────────────────────────
 
 (deftest score-is-resolve-without-a-transport

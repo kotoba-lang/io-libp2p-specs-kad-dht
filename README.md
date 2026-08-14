@@ -149,15 +149,29 @@ maps as `:body`.
 
 This process is still not a DHT node.
 
+**Peer lookup is specified.** `find-peers` unions `GET /routing/v1/peers/{peer-id}`
+across routers. Spec: 404 is 200 with 0 results. Empty with quorum met means
+we asked and nobody knows that peer. This is routing, not discovery — no CID.
+
+```clojure
+(routing/find-peers http-fn "12D3KooW…"
+  {:routers ["https://delegated-ipfs.dev/routing/v1"]
+   :quorum 1
+   :parse-fn parse-json})
+;; => {:ok? true :asked "12D3KooW…" :peers [{:plane :routing :peer "12D3KooW…" :addrs […] …}] …}
+```
+
 **Provide over HTTP is historic, not a routing-v1 write.** The spec
 documents `GET /routing/v1/providers/{cid}` and `PUT /routing/v1/ipns/{name}`.
 It does not document a vendor-agnostic provide. `provide` talks to
 `PUT /routing/v1/providers` (no CID in the path — the CID is in
 `Payload.Keys`) with the bitswap envelope IPNI used. This library does
-not sign and does not invent a clock. A router that requires a signature
-returns 400; that is a rejection, not a silent pass. `encode-fn` is
-injected; this library holds no JSON encoder. Succeeds if any router
-accepted, same rule as IPNS `publish`.
+not sign and does not invent a clock. There is **no default sign-fn**:
+IPIP-0526 is historic; DAG-JSON vs DAG-CBOR was never settled. Forging
+one would be theater. A router that requires a signature returns 400;
+that is a rejection, not a silent pass. `encode-fn` is injected; this
+library holds no JSON encoder. Succeeds if any router accepted, same
+rule as IPNS `publish`.
 
 ```clojure
 (routing/provide http-fn {:cid "bafybei…" :peer "12D3KooW…" :addrs ["/ip4/…/tcp/4001"]}
@@ -189,5 +203,5 @@ quorum, validation, selection and the `:not-found` / `:all-routers-failed` /
 clojure -M:test
 ```
 
-54 tests / 165 assertions, including a lookup converging over a simulated
+59 tests / 182 assertions, including a lookup converging over a simulated
 200-peer network and one that terminates against a wholly unreachable one.
