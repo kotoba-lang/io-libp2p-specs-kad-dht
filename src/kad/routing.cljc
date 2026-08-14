@@ -39,9 +39,14 @@
   ## Transport is injected
 
   `http-fn` is `(fn [{:keys [method url headers body]}] -> {:status :headers :body})`
-  with `body` as octets. No HTTP client is imported, for the same reason
-  `godaddy-dns` injects `IDns`: the caller owns the network, the timeouts and
-  the TLS, and a library that owned them would be untestable without one."
+  with `body` as octets (IPNS) or a parsed map (providers tests). No HTTP
+  client and no JSON parser are imported: the caller owns the network, the
+  timeouts, the TLS, and JSON. A library that owned them would be untestable
+  without one.
+
+  IPNS is a signed record (`get-ipns` / `resolve`). Providers are an index
+  (`get-providers` / `find-providers`). Both are delegated routing. Neither
+  makes this process a DHT node."
   (:refer-clojure :exclude [resolve])
   (:require [clojure.string :as str]))
 
@@ -207,3 +212,141 @@
                      (str "ok, " (count (:record r)) " octets")
                      (str (name (:reason r))
                           (when (:status r) (str " " (:status r)))))))))
+
+;; ── providers (HTTP routing v1 GET /providers/{cid}) ──────────────────────
+
+(def ^:const providers-accept
+  "Providers are a JSON index, not a signed record. Asking for the IPNS
+  media type here returns something you cannot parse as Providers."
+  "application/json")
+
+(defn- provider-id [p]
+  (or (:ID p) (:id p) (get p "ID") (get p "id")))
+
+(defn- provider-addrs [p]
+  (or (:Addrs p) (:addrs p) (get p "Addrs") (get p "addrs") []))
+
+(defn- providers-of [body]
+  (or (:Providers body) (:providers body)
+      (get body "Providers") (get body "providers") []))
+
+(defn- provider-record
+  "Same shape as `kotoba.protocol.discover/record`, by convention not by
+  require. This library must not depend on kotoba-protocol."
+  [cid p]
+  (let [id (provider-id p)]
+    (when (string? id)
+      {:plane :discovery
+       :cid cid
+       :peer id
+       :addrs (vec (provider-addrs p))
+       :mutates-cid? false})))
+
+(defn- body->map
+  "Tests pass already-parsed maps. Production injects `parse-fn` for JSON
+  octets. No JSON parser lives here."
+  [body parse-fn]
+  (cond
+    (map? body) body
+    (nil? body) nil
+    (and parse-fn (or (string? body) (sequential? body)))
+    (try (parse-fn body)
+         (catch #?(:clj Exception :cljs :default) _ :parse-failed))
+    :else :unparsed))
+
+(defn get-providers
+  "Fetch who serves `cid` from one delegated router.
+
+  GET `{router}/providers/{cid}`. Never throws. Never rewrites `cid`.
+  A 404 and a 200 with an empty Providers list are the same discovery
+  answer: this router knows nobody. Transport failure is a different
+  answer — we could not ask.
+
+  `parse-fn` is `(fn [body] map)` and is required when `body` is not
+  already a map. Tests pass maps. Production wires `clojure.data.json`
+  or `js/JSON.parse`. This namespace does not import a JSON library."
+  ([http-fn router cid]
+   (get-providers http-fn router cid {}))
+  ([http-fn router cid {:keys [parse-fn]}]
+   (if-not (string? cid)
+     {:ok? false :reason :invalid-cid :value cid :router router}
+     (try
+       (let [{:keys [status body]} (http-fn {:method :get
+                                             :url (str router "/providers/" cid)
+                                             :headers {"Accept" providers-accept}})
+             parsed (body->map body parse-fn)]
+         (cond
+           (= 404 status)
+           {:ok? true :providers [] :router router :cid cid :empty? true}
+           (not= 200 status)
+           {:ok? false :reason :http-error :status status :router router :cid cid}
+           (nil? parsed)
+           {:ok? false :reason :empty-body :router router :cid cid}
+           (#{:unparsed :parse-failed} parsed)
+           {:ok? false :reason :body-not-map :router router :cid cid}
+           (not (map? parsed))
+           {:ok? false :reason :body-not-map :router router :cid cid}
+           :else
+           {:ok? true
+            :providers (vec (keep #(provider-record cid %) (providers-of parsed)))
+            :router router
+            :cid cid}))
+       (catch #?(:clj Exception :cljs :default) e
+         {:ok? false :reason :transport-error :router router :cid cid
+          :detail #?(:clj (.getMessage e) :cljs (str e))})))))
+
+(defn score-providers
+  "The pure half of `find-providers`: union by `:peer` across responses
+  already fetched. Quorum counts routers that **answered** (200 or 404),
+  not peers found. Empty union with quorum met is success — we asked,
+  nobody provides. All transport failures are `:all-routers-failed`.
+
+  Does not rewrite `cid`. A Worker that cannot supply a synchronous
+  `http-fn` fetches on its own and calls this."
+  [cid responses {:keys [quorum] :or {quorum 1}}]
+  (let [ok (filterv :ok? responses)
+        by-peer (reduce (fn [m p]
+                          (if (string? (:peer p))
+                            (assoc m (:peer p) p)
+                            m))
+                        {}
+                        (mapcat :providers ok))]
+    (if (>= (count ok) quorum)
+      {:ok? true
+       :cid cid
+       :providers (vec (vals by-peer))
+       :answered (count ok)
+       :routers (mapv :router ok)
+       :responses responses
+       :mutates-cid? false}
+      {:ok? false
+       :cid cid
+       :reason (cond
+                 (empty? ok) :all-routers-failed
+                 :else :quorum-unmet)
+       :answered (count ok)
+       :quorum quorum
+       :responses responses})))
+
+(defn find-providers
+  "Ask several delegated routers who serves `cid`, and union the answers.
+
+  Requires a synchronous `http-fn`. See `score-providers` for the pure
+  half a Worker composes with its own async fetches.
+
+  This process is still not a DHT node. The records are real provider
+  advertisements; you see them only through the endpoints you ask.
+
+  Production wiring into kotoba-protocol:
+
+      (fn [cid]
+        (kad.routing/find-providers http-fn cid opts))
+
+  then `kotoba.protocol.discover/lookup-live`. This namespace does not
+  require kotoba-protocol."
+  [http-fn cid {:keys [routers quorum]
+                :or {routers default-routers quorum 1}
+                :as opts}]
+  (score-providers cid
+                   (mapv #(get-providers http-fn % cid opts) routers)
+                   {:quorum quorum}))

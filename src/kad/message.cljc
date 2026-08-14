@@ -86,6 +86,20 @@
   [peer-id]
   {:type (message-type :find-node) :key (vec peer-id)})
 
+(defn get-providers
+  "A GET_PROVIDERS request. The key is the CID bytes. Asking who serves a
+  CID does not rewrite that CID."
+  [cid-key]
+  {:type (message-type :get-providers) :key (vec cid-key)})
+
+(defn add-provider
+  "An ADD_PROVIDER request: advertise that `peer` serves `cid-key`.
+  Overlay, not a merkle rewrite — the CID stays the CID."
+  [cid-key peer]
+  {:type (message-type :add-provider)
+   :key (vec cid-key)
+   :provider-peers [peer]})
+
 (defn encode [m] (pb/encode schema m))
 (defn decode [bs] (pb/decode schema bs))
 
@@ -113,6 +127,13 @@
   rather than nil when absent, so a lookup can concat without checking."
   [msg]
   (vec (:closer-peers msg)))
+
+(defn provider-peers
+  "The `providerPeers` of a GET_PROVIDERS / ADD_PROVIDER message. Empty rather
+  than nil when absent. These peers serve the CID in `:key`; they are not a
+  rewrite of that CID."
+  [msg]
+  (vec (:provider-peers msg)))
 
 (defn peer-id-hex [peer]
   (apply str (map #(let [s #?(:clj (Integer/toHexString (bit-and % 0xFF))

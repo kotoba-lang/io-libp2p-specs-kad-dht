@@ -75,6 +75,23 @@
     (is (= 1 (:type (msg/decode bs))) "GET_VALUE is 1")
     (is (pb/round-trips? msg/schema bs))))
 
+(deftest a-get-providers-round-trips
+  (let [cid-key [1 2 3 4]
+        m (msg/get-providers cid-key)
+        back (msg/decode (msg/encode m))]
+    (is (= 3 (:type back)) "GET_PROVIDERS is 3")
+    (is (= cid-key (:key back)))
+    (is (= [] (msg/provider-peers back)))
+    (is (pb/round-trips? msg/schema (msg/encode m)))))
+
+(deftest an-add-provider-carries-provider-peers
+  (let [peer {:id [9 9 9] :addrs [[10 11]]}
+        m (msg/add-provider [1 2 3] peer)
+        back (msg/decode (msg/encode m))]
+    (is (= 2 (:type back)) "ADD_PROVIDER is 2")
+    (is (= [peer] (msg/provider-peers back))
+        "who serves the CID is overlay, not a rewrite of the CID")))
+
 (deftest a-put-value-carries-the-ipns-record-nested-inside-a-libp2p-record
   (let [rk (vec (pb/utf8-bytes "/ipns/somekey"))
         ipns-bytes [0x0A 0x03 1 2 3]
@@ -95,6 +112,8 @@
 (deftest field-numbers-are-the-protocol
   (is (= 2 (first (keep (fn [[n d]] (when (= :key (:name d)) n)) msg/schema))))
   (is (= 8 (first (keep (fn [[n d]] (when (= :closer-peers (:name d)) n)) msg/schema))))
+  (is (= 9 (first (keep (fn [[n d]] (when (= :provider-peers (:name d)) n)) msg/schema)))
+      "providerPeers is 9; the gap after key(2) is removed fields, not a mistake")
   (is (= 10 (first (keep (fn [[n d]] (when (= :cluster-level-raw (:name d)) n)) msg/schema)))
       "declaration order in the .proto is not wire order"))
 
@@ -281,6 +300,98 @@
     (testing "and fails only when every router refused"
       (is (false? (:ok? (routing/publish http "k51abc" [1]
                                          {:routers ["https://bad"]})))))))
+
+(def ^:private provider-cid
+  "bafybeidl5t4ztktqmfcqrfqpio6qf64n6t65a7inkz2pa6jq4tyqwfjfhy")
+
+(deftest get-providers-does-not-rewrite-the-cid
+  (let [http (constantly {:status 200
+                          :body {:Providers [{:ID "12D3KooWpeer"
+                                              :Addrs ["/ip4/127.0.0.1/tcp/4001"]}]}})
+        r (routing/get-providers http "https://r/routing/v1" provider-cid)]
+    (is (:ok? r))
+    (is (= provider-cid (:cid r)))
+    (is (= provider-cid (:cid (first (:providers r)))))
+    (is (false? (:mutates-cid? (first (:providers r)))))
+    (is (= :discovery (:plane (first (:providers r)))))))
+
+(deftest get-providers-asks-for-json-not-an-ipns-record
+  (let [seen (atom nil)
+        http (fn [req] (reset! seen req) {:status 200 :body {:Providers []}})
+        _ (routing/get-providers http "https://r/routing/v1" provider-cid)]
+    (is (= (str "https://r/routing/v1/providers/" provider-cid) (:url @seen)))
+    (is (= routing/providers-accept (get-in @seen [:headers "Accept"])))))
+
+(deftest a-404-from-providers-is-answered-empty-not-an-outage
+  (let [r (routing/get-providers (http-stub {}) "https://r/routing/v1" provider-cid)]
+    (is (:ok? r))
+    (is (= [] (:providers r)))
+    (is (true? (:empty? r)))))
+
+(deftest providers-json-octets-need-an-injected-parser
+  (let [http (constantly {:status 200 :body "{\"Providers\":[{\"ID\":\"12D3KooWpeer\"}]}"})
+        no-parse (routing/get-providers http "https://r/routing/v1" provider-cid)
+        parsed (routing/get-providers http "https://r/routing/v1" provider-cid
+                                      {:parse-fn (fn [_] {:Providers [{:ID "12D3KooWpeer"}]})})]
+    (is (false? (:ok? no-parse)))
+    (is (= :body-not-map (:reason no-parse))
+        "this library holds no JSON parser; a string body without parse-fn is not a pass")
+    (is (:ok? parsed))
+    (is (= "12D3KooWpeer" (:peer (first (:providers parsed)))))))
+
+(deftest find-providers-unions-by-peer-across-routers
+  (let [http (fn [{:keys [url]}]
+               {:status 200
+                :body {:Providers (if (str/starts-with? url "https://r1")
+                                    [{:ID "12D3KooWa" :Addrs ["/ip4/1.1.1.1/tcp/4001"]}
+                                     {:ID "12D3KooWshared"}]
+                                    [{:ID "12D3KooWb"}
+                                     {:ID "12D3KooWshared"}])}})
+        r (routing/find-providers http provider-cid
+                                  {:routers ["https://r1/routing/v1" "https://r2/routing/v1"]
+                                   :quorum 2})]
+    (is (:ok? r))
+    (is (= 2 (:answered r)))
+    (is (= #{"12D3KooWa" "12D3KooWb" "12D3KooWshared"}
+           (set (map :peer (:providers r)))))
+    (is (every? #(= provider-cid (:cid %)) (:providers r)))
+    (is (false? (:mutates-cid? r)))))
+
+(deftest find-providers-tells-empty-from-down
+  (let [empty (routing/find-providers (constantly {:status 404}) provider-cid
+                                      {:routers ["https://r1/routing/v1"]})
+        down (routing/find-providers (fn [_] (throw (ex-info "x" {}))) provider-cid
+                                     {:routers ["https://r1/routing/v1"]})]
+    (is (:ok? empty))
+    (is (= [] (:providers empty))
+        "we asked; nobody provides. that is not an outage")
+    (is (false? (:ok? down)))
+    (is (= :all-routers-failed (:reason down)))))
+
+(deftest find-providers-quorum-counts-routers-that-answered
+  (let [http (fn [{:keys [url]}]
+               (if (str/starts-with? url "https://r1")
+                 {:status 200 :body {:Providers [{:ID "12D3KooWpeer"}]}}
+                 (throw (ex-info "down" {}))))
+        r (routing/find-providers http provider-cid
+                                  {:routers ["https://r1/routing/v1" "https://r2/routing/v1"]
+                                   :quorum 2})]
+    (is (false? (:ok? r)))
+    (is (= :quorum-unmet (:reason r)))
+    (is (= 1 (:answered r)))))
+
+(deftest score-providers-is-find-without-a-transport
+  (let [cid provider-cid
+        responses [{:ok? true :providers [{:peer "12D3KooWa" :cid cid :plane :discovery
+                                           :addrs [] :mutates-cid? false}]
+                    :router "https://r1"}
+                   {:ok? true :providers [{:peer "12D3KooWb" :cid cid :plane :discovery
+                                           :addrs [] :mutates-cid? false}]
+                    :router "https://r2"}]
+        r (routing/score-providers cid responses {:quorum 2})]
+    (is (:ok? r))
+    (is (= 2 (:answered r)))
+    (is (= #{"12D3KooWa" "12D3KooWb"} (set (map :peer (:providers r)))))))
 
 ;; ── the pure scoring half ─────────────────────────────────────────────────
 
