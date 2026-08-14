@@ -45,7 +45,7 @@ already implements the pattern), multistream-select 1.0.0, a stream muxer
 | `kad.message` | the `/ipfs/kad/1.0.0` `Message` and the libp2p `Record` it carries |
 | `kad.lookup` | the iterative α=3 lookup, as `state + responses → state + next-queries` |
 | `kad.table` | the k-bucket routing table a *node* keeps, with Kademlia's eviction rule |
-| `kad.routing` | HTTP delegated routing (`/routing/v1`), multi-router with quorum |
+| `kad.routing` | HTTP delegated routing (`/routing/v1`): IPNS records **and** CID providers. multi-router with quorum |
 
 ## The eviction rule is the eclipse defence
 
@@ -131,6 +131,24 @@ answered and nothing validated. There is a test.
 No HTTP client is imported: the caller owns the network, the timeouts and the
 TLS.
 
+**Providers are an index, not a signed record.** `find-providers` unions
+`GET /routing/v1/providers/{cid}` across routers. Quorum counts routers that
+*answered*, not peers found. Empty union with quorum met means we asked and
+nobody provides — that is not an outage. JSON parsing is injected
+(`parse-fn`); this library holds no JSON parser. Tests pass already-parsed
+maps as `:body`.
+
+```clojure
+(routing/find-providers http-fn "bafybei…"
+  {:routers ["https://delegated-ipfs.dev/routing/v1"]
+   :quorum 1
+   :parse-fn parse-json})
+;; => {:ok? true :cid "bafybei…" :providers [{:plane :discovery :peer "12D3KooW…"
+;;                                           :addrs […] :mutates-cid? false}] …}
+```
+
+This process is still not a DHT node.
+
 **A synchronous `http-fn` is not universal.** A JVM job can supply one; a
 Cloudflare Worker cannot — `fetch` there is a Promise and nothing can await it
 inside a synchronous function. So the scoring is split out as `routing/score`,
@@ -154,5 +172,5 @@ quorum, validation, selection and the `:not-found` / `:all-routers-failed` /
 clojure -M:test
 ```
 
-40 tests / 108 assertions, including a lookup converging over a simulated
+50 tests / 144 assertions, including a lookup converging over a simulated
 200-peer network and one that terminates against a wholly unreachable one.
