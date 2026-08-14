@@ -149,6 +149,23 @@ maps as `:body`.
 
 This process is still not a DHT node.
 
+**Provide over HTTP is historic, not a routing-v1 write.** The spec
+documents `GET /routing/v1/providers/{cid}` and `PUT /routing/v1/ipns/{name}`.
+It does not document a vendor-agnostic provide. `provide` talks to
+`PUT /routing/v1/providers` (no CID in the path — the CID is in
+`Payload.Keys`) with the bitswap envelope IPNI used. This library does
+not sign and does not invent a clock. A router that requires a signature
+returns 400; that is a rejection, not a silent pass. `encode-fn` is
+injected; this library holds no JSON encoder. Succeeds if any router
+accepted, same rule as IPNS `publish`.
+
+```clojure
+(routing/provide http-fn {:cid "bafybei…" :peer "12D3KooW…" :addrs ["/ip4/…/tcp/4001"]}
+  {:routers ["https://delegated-ipfs.dev/routing/v1"]
+   :encode-fn encode-json})
+;; => {:ok? true :cid "bafybei…" :accepted ["https://delegated-ipfs.dev/routing/v1"] …}
+```
+
 **A synchronous `http-fn` is not universal.** A JVM job can supply one; a
 Cloudflare Worker cannot — `fetch` there is a Promise and nothing can await it
 inside a synchronous function. So the scoring is split out as `routing/score`,
@@ -172,5 +189,5 @@ quorum, validation, selection and the `:not-found` / `:all-routers-failed` /
 clojure -M:test
 ```
 
-50 tests / 144 assertions, including a lookup converging over a simulated
+54 tests / 165 assertions, including a lookup converging over a simulated
 200-peer network and one that terminates against a wholly unreachable one.

@@ -350,3 +350,91 @@
   (score-providers cid
                    (mapv #(get-providers http-fn % cid opts) routers)
                    {:quorum quorum}))
+
+;; ── provide (historic PUT /providers — not in routing v1) ─────────────────
+
+(defn provider-envelope
+  "The JSON body of the historic `PUT /routing/v1/providers` endpoint
+  (index-provider / IPNI, IPIP-0526). The current HTTP routing v1 spec
+  documents GET providers and PUT IPNS. It does **not** document a
+  vendor-agnostic provide. IPIP-378 (POST) closed without landing.
+
+  CID lives in `Payload.Keys`, not in the URL. This library does not
+  sign and does not invent a clock: `sign-fn` and `timestamp-ms` are
+  injected or omitted. Omitting them is not a pass on authenticity —
+  a router that requires a signature will 400, which is the useful
+  answer."
+  [{:keys [cid peer addrs timestamp-ms advisory-ttl sign-fn]}]
+  (cond
+    (not (string? cid)) {:ok? false :reason :invalid-cid :value cid}
+    (not (string? peer)) {:ok? false :reason :invalid-peer :value peer}
+    :else
+    (let [payload (cond-> {:Keys [cid] :ID peer :Addrs (vec (or addrs []))}
+                    timestamp-ms (assoc :Timestamp timestamp-ms)
+                    advisory-ttl (assoc :AdvisoryTTL advisory-ttl))
+          rec (cond-> {:Schema "bitswap"
+                       :Protocol "transport-bitswap"
+                       :Payload payload}
+                sign-fn (assoc :Signature (sign-fn payload)))]
+      {:ok? true
+       :cid cid
+       :envelope {:Providers [rec]}
+       :mutates-cid? false})))
+
+(defn put-providers
+  "PUT `{router}/providers` with a historic bitswap envelope.
+
+  Never throws. Never rewrites `cid`. Never signs unless `sign-fn` is
+  given. `encode-fn` is `(fn [envelope] body)` — tests pass the map;
+  production wires JSON. This namespace does not import a JSON library.
+
+  A 2xx means this router accepted the advertisement. That is not the
+  same thing as the CID being in the DHT, and it is not this process
+  becoming a DHT node."
+  ([http-fn router rec]
+   (put-providers http-fn router rec {}))
+  ([http-fn router rec {:keys [encode-fn sign-fn timestamp-ms advisory-ttl]}]
+   (let [env (provider-envelope (assoc rec :sign-fn sign-fn
+                                       :timestamp-ms timestamp-ms
+                                       :advisory-ttl advisory-ttl))]
+     (if-not (:ok? env)
+       (assoc env :router router)
+       (try
+         (let [body (if encode-fn (encode-fn (:envelope env)) (:envelope env))
+               {:keys [status body]} (http-fn {:method :put
+                                               :url (str router "/providers")
+                                               :headers {"Content-Type" providers-accept}
+                                               :body body})]
+           (if (<= 200 status 299)
+             {:ok? true :router router :status status
+              :cid (:cid env) :mutates-cid? false}
+             {:ok? false :reason :rejected :status status :router router
+              :cid (:cid env)
+              :detail (when (and body (not (map? body)))
+                        (apply str (map char (take 200 (->octets body)))))}))
+         (catch #?(:clj Exception :cljs :default) e
+           {:ok? false :reason :transport-error :router router :cid (:cid env)
+            :detail #?(:clj (.getMessage e) :cljs (str e))}))))))
+
+(defn provide
+  "Advertise through every router. Succeeds if **any** accepted, same
+  rule as `publish` for IPNS: one node having the record is enough.
+
+  Historic endpoint. Does not rewrite cid. Does not sign. This process
+  is still not a DHT node.
+
+  Production wiring into kotoba-protocol:
+
+      (fn [rec]
+        (kad.routing/provide http-fn rec opts))
+
+  then `kotoba.protocol.discover/advertise-live`."
+  [http-fn rec {:keys [routers] :or {routers default-routers} :as opts}]
+  (let [results (mapv #(put-providers http-fn % rec opts) routers)
+        ok (filterv :ok? results)
+        cid (:cid rec)]
+    {:ok? (boolean (seq ok))
+     :cid cid
+     :mutates-cid? false
+     :accepted (mapv :router ok)
+     :rejected (filterv (complement :ok?) results)}))
