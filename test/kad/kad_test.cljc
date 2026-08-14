@@ -393,6 +393,57 @@
     (is (= 2 (:answered r)))
     (is (= #{"12D3KooWa" "12D3KooWb"} (set (map :peer (:providers r)))))))
 
+(def ^:private provider-rec
+  {:cid provider-cid :peer "12D3KooWpeer" :addrs ["/ip4/127.0.0.1/tcp/4001"]})
+
+(deftest provider-envelope-puts-cid-in-keys-not-the-url
+  (let [env (routing/provider-envelope provider-rec)
+        rec (first (get-in env [:envelope :Providers]))]
+    (is (:ok? env))
+    (is (= provider-cid (:cid env)))
+    (is (false? (:mutates-cid? env)))
+    (is (= [provider-cid] (get-in rec [:Payload :Keys])))
+    (is (= "12D3KooWpeer" (get-in rec [:Payload :ID])))
+    (is (= "bitswap" (:Schema rec)))
+    (is (nil? (:Signature rec))
+        "this library holds no crypto; a missing signature is omitted, not forged")
+    (is (nil? (get-in rec [:Payload :Timestamp]))
+        "this library holds no clock")))
+
+(deftest put-providers-does-not-rewrite-the-cid
+  (let [seen (atom nil)
+        http (fn [req] (reset! seen req) {:status 200})
+        r (routing/put-providers http "https://r/routing/v1" provider-rec)]
+    (is (:ok? r))
+    (is (= provider-cid (:cid r)))
+    (is (false? (:mutates-cid? r)))
+    (is (= "https://r/routing/v1/providers" (:url @seen))
+        "historic PUT has no CID in the path; GET does")
+    (is (= :put (:method @seen)))
+    (is (= routing/providers-accept (get-in @seen [:headers "Content-Type"])))
+    (is (= [provider-cid] (get-in @seen [:body :Providers 0 :Payload :Keys])))))
+
+(deftest provide-succeeds-if-any-router-accepted
+  (let [http (fn [{:keys [url]}]
+               (if (str/starts-with? url "https://ok") {:status 200} {:status 400}))
+        r (routing/provide http provider-rec
+                           {:routers ["https://ok/routing/v1" "https://bad/routing/v1"]})]
+    (is (:ok? r))
+    (is (= ["https://ok/routing/v1"] (:accepted r)))
+    (is (= 1 (count (:rejected r))))
+    (is (= provider-cid (:cid r)))
+    (testing "and fails only when every router refused"
+      (is (false? (:ok? (routing/provide http provider-rec
+                                         {:routers ["https://bad/routing/v1"]})))))))
+
+(deftest provide-json-octets-need-an-injected-encoder
+  (let [seen (atom nil)
+        http (fn [req] (reset! seen req) {:status 200})
+        _ (routing/put-providers http "https://r/routing/v1" provider-rec
+                                 {:encode-fn (fn [_] "{\"Providers\":[]}")})]
+    (is (= "{\"Providers\":[]}" (:body @seen))
+        "this library holds no JSON encoder")))
+
 ;; ── the pure scoring half ─────────────────────────────────────────────────
 
 (deftest score-is-resolve-without-a-transport
