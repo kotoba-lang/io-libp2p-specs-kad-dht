@@ -140,7 +140,8 @@ maps as `:body`.
 
 ```clojure
 (routing/find-providers http-fn "bafybei…"
-  {:routers ["https://delegated-ipfs.dev/routing/v1"]
+  {:routers ["https://delegated-ipfs.dev/routing/v1"
+             "https://cid.contact/routing/v1"]
    :quorum 1
    :parse-fn parse-json})
 ;; => {:ok? true :cid "bafybei…" :providers [{:plane :discovery :peer "12D3KooW…"

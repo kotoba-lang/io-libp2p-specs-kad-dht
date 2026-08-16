@@ -56,7 +56,8 @@
   their own (Kubo exposes `/routing/v1` directly) and passes it here. These
   exist so the first call works rather than requiring infrastructure before the
   first experiment."
-  ["https://delegated-ipfs.dev/routing/v1"])
+  ["https://delegated-ipfs.dev/routing/v1"
+   "https://cid.contact/routing/v1"])
 
 (def ^:const ipns-record-content-type
   "The media type an IPNS record is fetched and published as. Asking for
