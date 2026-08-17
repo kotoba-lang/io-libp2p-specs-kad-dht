@@ -4,7 +4,7 @@
  ;; injected, so this library holds no crypto, no socket and no clock.
  :deps {io.github.kotoba-lang/dev-protobuf
         {:git/url "https://github.com/kotoba-lang/dev-protobuf.git"
-         :git/sha "fe67052627a70f3e406fab2f8dc475ea304be94c"}}
+         :git/sha "3f20b1e1cdbe89750d8afaf24f64777a2f170c3c"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
