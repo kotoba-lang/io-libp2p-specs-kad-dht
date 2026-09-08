@@ -22,7 +22,7 @@
   distance measured on them would pile every IPNS name into one corner of the
   keyspace. SHA-256 is what makes the space uniform, and it is why the
   transform is mandatory rather than an optimization."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def ^:const key-bits 256)
 (def ^:const key-bytes 32)

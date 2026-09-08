@@ -1,5 +1,5 @@
 (ns kad.kad-test
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kad.key :as kkey]
             [kad.lookup :as lookup]
