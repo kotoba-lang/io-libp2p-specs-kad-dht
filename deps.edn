@@ -2,7 +2,12 @@
  ;; The Kademlia message is protobuf; that is the only runtime dependency.
  ;; Hashing (kad.key), HTTP (kad.routing) and record validation are all
  ;; injected, so this library holds no crypto, no socket and no clock.
- :deps {io.github.kotoba-lang/dev-protobuf
+ :deps {
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+       io.github.kotoba-lang/dev-protobuf
         {:git/url "https://github.com/kotoba-lang/dev-protobuf.git"
          :git/sha "3f20b1e1cdbe89750d8afaf24f64777a2f170c3c"}}
  :aliases

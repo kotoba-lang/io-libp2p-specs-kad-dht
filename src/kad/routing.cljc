@@ -48,7 +48,7 @@
   (`get-providers` / `find-providers`). Both are delegated routing. Neither
   makes this process a DHT node."
   (:refer-clojure :exclude [resolve])
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def default-routers
   "Public delegated routing endpoints. Listed as a *default*, not a
