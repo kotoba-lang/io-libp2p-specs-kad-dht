@@ -201,7 +201,7 @@ quorum, validation, selection and the `:not-found` / `:all-routers-failed` /
 ## Test
 
 ```
-clojure -M:test
+kbb -M:test
 ```
 
 59 tests / 182 assertions, including a lookup converging over a simulated
